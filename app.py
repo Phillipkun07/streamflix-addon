@@ -1,0 +1,1126 @@
+"""
+StreamFlix Stremio Addon — main app.
+
+Exposes Stremio addon endpoints:
+    GET /manifest.json
+    GET /catalog/:type/:id.json               (catalog browsing)
+    GET /catalog/:type/:id/search=:query.json (search)
+    GET /meta/:type/:id.json                  (metadata)
+    GET /stream/:type/:id.json                (stream resolution)
+
+Plus a simple HTML UI at /ui for manual testing (no Gradio, to keep startup fast).
+
+Stremio ID conventions:
+    Movies:  flixlatam:{slug}      e.g. flixlatam:sultana-hUFIlu
+    Series:  flixlatam:{slug}      e.g. flixlatam:en-coma-BVwton
+    Episodes: flixlatam:{slug}:1:1 (slug:season:episode)
+
+When Stremio asks for /stream/movie/tt0816692.json (raw IMDb ID), we look up
+the slug by trying the IMDb ID directly against flixlatam's /vidurl/{imdb}/
+endpoint. If that works, great. If not, we return [].
+"""
+
+import os
+import re
+import logging
+from typing import Optional
+
+import requests
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, HTMLResponse
+import uvicorn
+
+# Local imports - make sure 'providers' and 'utils' are importable
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from providers import flixlatam
+from providers import latanime
+from providers import seriesflix
+from providers import tioanime
+from providers import fanpelis
+from providers import cinecalidad
+from providers import sololatino
+from utils.flaresolverr import is_enabled as flaresolverr_enabled
+from utils import autoscrape
+
+# ============================================================
+# Logging
+# ============================================================
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("streamflix")
+
+# ============================================================
+# Config
+# ============================================================
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+ADDON_NAME = os.environ.get("ADDON_NAME", "StreamFlix Reborn (FlixLatam)")
+ADDON_VERSION = "2.1.0"
+ADDON_ID = "community.streamflix.flixlatam"
+
+# Authentication: set ADDON_TOKEN to require ?token=... in all requests.
+# Stremio passes the query string from the install URL to all subsequent requests.
+ADDON_TOKEN = os.environ.get("ADDON_TOKEN", "")
+
+
+# ============================================================
+# Token authentication helpers
+# ============================================================
+def _check_token(request: Request) -> bool:
+    """Return True if the request has the correct token (or if no token is required)."""
+    if not ADDON_TOKEN:
+        return True  # No token required, addon is public
+    # Check query parameter (?token=...)
+    token = request.query_params.get("token", "")
+    # Also check Authorization header (Bearer token)
+    if not token:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+    # Also check X-Addon-Token header
+    if not token:
+        token = request.headers.get("X-Addon-Token", "")
+    return token == ADDON_TOKEN
+
+
+def _require_token(request: Request):
+    """Return a 401 JSONResponse if the token is missing/invalid, else None."""
+    if not _check_token(request):
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Unauthorized. Add ?token=YOUR_TOKEN to the URL."},
+        )
+    return None
+
+
+# ============================================================
+# FastAPI app
+# ============================================================
+app = FastAPI(title="StreamFlix Stremio Addon")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# Stremio addon: manifest
+# ============================================================
+@app.get("/manifest.json")
+def manifest(request: Request):
+    err = _require_token(request)
+    if err:
+        return err
+    catalogs = [
+        {
+            "type": "movie",
+            "id": "flixlatam_movies",
+            "name": "FlixLatam · Películas",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "movie",
+            "id": "flixlatam_popular",
+            "name": "FlixLatam · Populares",
+            "extraSupported": ["page"],
+        },
+        {
+            "type": "series",
+            "id": "flixlatam_series",
+            "name": "FlixLatam · Series",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "latanime_catalog",
+            "name": "Latanime · Anime",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "seriesflix_catalog",
+            "name": "SeriesFlix · Series HD",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "tioanime_catalog",
+            "name": "TioAnime · Anime",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "movie",
+            "id": "fanpelis_movies",
+            "name": "Fanpelis · Películas HD",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "fanpelis_series",
+            "name": "Fanpelis · Series HD",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "movie",
+            "id": "cinecalidad_movies",
+            "name": "CineCalidad · Películas",
+            "extraSupported": ["search", "page"],
+            "extra": [
+                {"name": "search", "isRequired": False},
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "movie",
+            "id": "global_search_movies",
+            "name": "🔍 Búsqueda Global · Películas",
+            "extraSupported": ["search"],
+            "extra": [
+                {"name": "search", "isRequired": True},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "global_search_series",
+            "name": "🔍 Búsqueda Global · Series",
+            "extraSupported": ["search"],
+            "extra": [
+                {"name": "search", "isRequired": True},
+            ],
+        },
+        {
+            "type": "movie",
+            "id": "sololatino_movies",
+            "name": "SoloLatino · Películas ⚠️",
+            "extraSupported": ["page"],
+            "extra": [
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+        {
+            "type": "series",
+            "id": "sololatino_series",
+            "name": "SoloLatino · Series ⚠️",
+            "extraSupported": ["page"],
+            "extra": [
+                {"name": "page", "isRequired": False, "options": [1, 2, 3, 4, 5]},
+            ],
+        },
+    ]
+    return {
+        "id": ADDON_ID,
+        "version": ADDON_VERSION,
+        "name": ADDON_NAME,
+        "description": "Streaming en Español y Latino desde FlixLatam + Latanime + SeriesFlix + TioAnime + Fanpelis. "
+                       "Catálogos completos + resolutor de streams.",
+        "logo": "https://flixlatam.com/images/logo.png",
+        "resources": ["catalog", "meta", "stream"],
+        "types": ["movie", "series"],
+        "idPrefixes": ["tt", "flixlatam:", "latanime:", "seriesflix:", "tioanime:", "fanpelis:", "cinecalidad:", "sololatino:"],
+        "catalogs": catalogs,
+        "behaviorHints": {"configurable": False},
+    }
+
+
+# ============================================================
+# Stremio addon: catalog
+# ============================================================
+@app.get("/catalog/{item_type}/{cat_id}.json")
+def catalog(item_type: str, cat_id: str, request: Request):
+    err = _require_token(request)
+    if err:
+        return err
+    page = int(request.query_params.get("page", 1) or 1)
+    search = request.query_params.get("search", "").strip()
+
+    log.info(f"catalog type={item_type} cat={cat_id} page={page} search={search!r}")
+
+    items = []
+    try:
+        if cat_id == "flixlatam_movies":
+            if search:
+                items = _search_flixlatam(search, "movie")
+            else:
+                items = flixlatam.get_movies(page=page)
+        elif cat_id == "flixlatam_popular":
+            items = flixlatam.get_popular_movies(page=page)
+        elif cat_id == "flixlatam_series":
+            if search:
+                items = _search_flixlatam(search, "series")
+            else:
+                items = flixlatam.get_series(page=page)
+        elif cat_id == "latanime_catalog":
+            if search:
+                items = latanime.search_anime(search)
+            else:
+                items = latanime.get_anime_list(page=page)
+        elif cat_id == "seriesflix_catalog":
+            if search:
+                items = seriesflix.search_series(search)
+            else:
+                items = seriesflix.get_series_list(page=page)
+        elif cat_id == "tioanime_catalog":
+            if search:
+                items = tioanime.search_anime(search)
+            else:
+                items = tioanime.get_anime_list(page=page)
+        elif cat_id == "fanpelis_movies":
+            items = fanpelis.get_movies(page=page, query=search)
+        elif cat_id == "fanpelis_series":
+            items = fanpelis.get_tvshows(page=page, query=search)
+        elif cat_id == "cinecalidad_movies":
+            items = cinecalidad.get_movies(page=page, query=search)
+        elif cat_id == "global_search_movies":
+            # Global search: search ALL movie providers in parallel
+            items = _global_search_movies(search)
+        elif cat_id == "global_search_series":
+            # Global search: search ALL series providers in parallel
+            items = _global_search_series(search)
+        elif cat_id == "sololatino_movies":
+            items = sololatino.get_movies(page=page)
+        elif cat_id == "sololatino_series":
+            items = sololatino.get_series(page=page)
+    except Exception as e:
+        log.exception(f"catalog error: {e}")
+
+    # Convert to Stremio metas
+    metas = []
+    for it in items:
+        meta = {
+            "id": it["id"] if "id" in it and it["id"].startswith(("flixlatam:", "latanime:")) 
+                  else f"{cat_id.split('_')[0]}:{it['slug']}",
+            "type": it["type"],
+            "name": it["name"],
+            "poster": it.get("poster"),
+        }
+        metas.append(meta)
+
+    return {"metas": metas}
+
+
+def _search_flixlatam(query: str, item_type: str) -> list[dict]:
+    """
+    Search FlixLatam. Their site uses JS-based search that returns no
+    results on the server side, so we fall back to returning the first
+    page of the catalog. Stremio will then use the IMDb IDs to cross-
+    reference with TMDB/Cinemeta (its own search) and find the right item.
+    """
+    # Try the URL pattern that flixlatam uses for query strings (no-op
+    # filter, returns full catalog) — at least gives Stremio something
+    # to display.
+    if item_type == "movie":
+        return flixlatam.get_movies(page=1)
+    return flixlatam.get_series(page=1)
+
+
+def _global_search_movies(query: str) -> list[dict]:
+    """
+    Search ALL movie providers in parallel and merge results.
+    Providers: FlixLatam, Fanpelis, CineCalidad.
+    """
+    import concurrent.futures
+    
+    if not query:
+        return []
+    
+    log.info(f"Global movie search: {query!r}")
+    all_items = []
+    seen_names = set()
+    
+    def search_provider(name, fn):
+        try:
+            results = fn(query)
+            log.info(f"  {name}: {len(results)} results")
+            return results
+        except Exception as e:
+            log.warning(f"  {name} search error: {e}")
+            return []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(search_provider, "Fanpelis", lambda q: fanpelis.get_movies(page=1, query=q)): None,
+            executor.submit(search_provider, "CineCalidad", lambda q: cinecalidad.search_movies(q)): None,
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                results = future.result(timeout=30)
+                for item in results:
+                    # Deduplicate by name (case-insensitive)
+                    name_key = item.get("name", "").lower().strip()
+                    if name_key and name_key not in seen_names:
+                        seen_names.add(name_key)
+                        all_items.append(item)
+            except Exception as e:
+                log.warning(f"Global search error: {e}")
+    
+    # Filter by query (case-insensitive match in name)
+    q_lower = query.lower()
+    filtered = [item for item in all_items if q_lower in item.get("name", "").lower()]
+    
+    # If no exact matches, return all (Stremio will show them)
+    if not filtered:
+        filtered = all_items
+    
+    log.info(f"Global movie search: {len(filtered)} unique results")
+    return filtered[:30]  # Limit to 30 results
+
+
+def _global_search_series(query: str) -> list[dict]:
+    """
+    Search ALL series providers in parallel and merge results.
+    Providers: FlixLatam, SeriesFlix, Fanpelis, Latanime, TioAnime.
+    """
+    import concurrent.futures
+    
+    if not query:
+        return []
+    
+    log.info(f"Global series search: {query!r}")
+    all_items = []
+    seen_names = set()
+    
+    def search_provider(name, fn):
+        try:
+            results = fn(query)
+            log.info(f"  {name}: {len(results)} results")
+            return results
+        except Exception as e:
+            log.warning(f"  {name} search error: {e}")
+            return []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(search_provider, "SeriesFlix", lambda q: seriesflix.search_series(q)): None,
+            executor.submit(search_provider, "Fanpelis", lambda q: fanpelis.get_tvshows(page=1, query=q)): None,
+            executor.submit(search_provider, "Latanime", lambda q: latanime.search_anime(q)): None,
+            executor.submit(search_provider, "TioAnime", lambda q: tioanime.search_anime(q)): None,
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                results = future.result(timeout=30)
+                for item in results:
+                    name_key = item.get("name", "").lower().strip()
+                    if name_key and name_key not in seen_names:
+                        seen_names.add(name_key)
+                        all_items.append(item)
+            except Exception as e:
+                log.warning(f"Global search error: {e}")
+    
+    # Filter by query
+    q_lower = query.lower()
+    filtered = [item for item in all_items if q_lower in item.get("name", "").lower()]
+    if not filtered:
+        filtered = all_items
+    
+    log.info(f"Global series search: {len(filtered)} unique results")
+    return filtered[:30]
+
+
+# ============================================================
+# Stremio addon: meta
+# ============================================================
+@app.get("/meta/{item_type}/{item_id}.json")
+def meta(item_type: str, item_id: str, request: Request):
+    err = _require_token(request)
+    if err:
+        return err
+    log.info(f"meta type={item_type} id={item_id}")
+
+    # item_id can be:
+    #   flixlatam:{slug}    -> FlixLatam movie/series
+    #   latanime:{slug}     -> Latanime series
+    #   tt{digits}          -> IMDb ID (we have to find the slug)
+    if item_id.startswith("flixlatam:"):
+        slug = item_id[len("flixlatam:"):]
+        if item_type == "movie":
+            info = flixlatam.get_movie_detail(slug)
+        else:
+            info = flixlatam.get_series_detail(slug)
+        if not info:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        m = {
+            "id": f"flixlatam:{slug}",
+            "type": item_type,
+            "name": info.get("name", slug),
+            "poster": info.get("poster"),
+            "description": info.get("description", ""),
+            "genres": info.get("genres", []),
+        }
+        if item_type == "series":
+            videos = []
+            for season, episodes in info.get("seasons", {}).items():
+                for ep in episodes:
+                    videos.append({
+                        "id": f"flixlatam:{slug}:{season}:{ep}",
+                        "title": f"T{season}E{ep}",
+                        "season": season,
+                        "episode": ep,
+                    })
+            m["videos"] = videos
+        return {"meta": m}
+
+    elif item_id.startswith("latanime:"):
+        slug = item_id[len("latanime:"):]
+        info = latanime.get_anime_detail(slug)
+        if not info:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        m = {
+            "id": f"latanime:{slug}",
+            "type": "series",
+            "name": info.get("name", slug),
+            "poster": info.get("poster"),
+            "description": info.get("description", ""),
+            "genres": info.get("genres", []),
+        }
+        videos = []
+        for ep in info.get("episodes", []):
+            videos.append({
+                "id": f"latanime:{slug}:{ep['season']}:{ep['episode']}",
+                "title": f"EP{ep['episode']}",
+                "season": ep["season"],
+                "episode": ep["episode"],
+            })
+        m["videos"] = videos
+        return {"meta": m}
+
+    elif item_id.startswith("seriesflix:"):
+        slug = item_id[len("seriesflix:"):]
+        info = seriesflix.get_series_detail(slug)
+        if not info:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        m = {
+            "id": f"seriesflix:{slug}",
+            "type": "series",
+            "name": info.get("name", slug),
+            "poster": info.get("poster"),
+            "description": info.get("description", ""),
+        }
+        # Build videos list from seasons (fetch episodes for each)
+        videos = []
+        for season in info.get("seasons", []):
+            try:
+                episodes = seriesflix.get_season_episodes(slug, season)
+            except Exception as e:
+                log.warning(f"get_season_episodes failed: {e}")
+                episodes = []
+            for ep in episodes:
+                videos.append({
+                    "id": f"seriesflix:{slug}:{season}:{ep}",
+                    "title": f"T{season}E{ep}",
+                    "season": season,
+                    "episode": ep,
+                })
+        m["videos"] = videos
+        return {"meta": m}
+
+    elif item_id.startswith("tioanime:"):
+        slug = item_id[len("tioanime:"):]
+        info = tioanime.get_anime_detail(slug)
+        if not info:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+        m = {
+            "id": f"tioanime:{slug}",
+            "type": "series",
+            "name": info.get("name", slug),
+            "poster": info.get("poster"),
+            "description": info.get("description", ""),
+            "genres": info.get("genres", []),
+        }
+        videos = []
+        for ep in info.get("episodes", []):
+            videos.append({
+                "id": f"tioanime:{slug}:{ep['season']}:{ep['episode']}",
+                "title": f"EP{ep['episode']}",
+                "season": ep["season"],
+                "episode": ep["episode"],
+            })
+        m["videos"] = videos
+        return {"meta": m}
+
+    elif item_id.startswith("fanpelis:"):
+        slug = item_id[len("fanpelis:"):]
+        # Detect if it's a movie or series
+        if item_type == "movie":
+            info = fanpelis.get_movie_detail(slug)
+            if not info:
+                return JSONResponse(status_code=404, content={"error": "not found"})
+            return {"meta": {
+                "id": f"fanpelis:{slug}",
+                "type": "movie",
+                "name": info.get("name", slug),
+                "poster": info.get("poster"),
+                "description": info.get("description", ""),
+            }}
+        else:
+            info = fanpelis.get_tvshow_detail(slug)
+            if not info:
+                return JSONResponse(status_code=404, content={"error": "not found"})
+            m = {
+                "id": f"fanpelis:{slug}",
+                "type": "series",
+                "name": info.get("name", slug),
+                "poster": info.get("poster"),
+                "description": info.get("description", ""),
+            }
+            # Fetch episodes (we have post_id)
+            post_id = info.get("post_id")
+            videos = []
+            if post_id:
+                try:
+                    eps = fanpelis.get_episodes(post_id)
+                    for ep in eps:
+                        # Each episode has season/episode info
+                        season = ep.get("season", 1)
+                        episode_num = ep.get("episode", 1)
+                        ep_id = ep.get("_id") or ep.get("id")
+                        videos.append({
+                            "id": f"fanpelis:{slug}:{season}:{episode_num}:{ep_id}",
+                            "title": f"T{season}E{episode_num}",
+                            "season": season,
+                            "episode": episode_num,
+                        })
+                except Exception as e:
+                    log.warning(f"get_episodes failed: {e}")
+            m["videos"] = videos
+            return {"meta": m}
+
+    elif item_id.startswith("cinecalidad:"):
+        slug = item_id[len("cinecalidad:"):]
+        return {"meta": {
+            "id": f"cinecalidad:{slug}",
+            "type": "movie",
+            "name": slug.replace("-", " ").title(),
+        }}
+
+    elif item_id.startswith("sololatino:"):
+        slug = item_id[len("sololatino:"):]
+        return {"meta": {
+            "id": f"sololatino:{slug}",
+            "type": item_type,
+            "name": slug.replace("-", " ").title(),
+        }}
+
+    elif item_id.startswith("tt"):
+        return _minimal_imdb_meta(item_type, item_id)
+
+    else:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Unknown id format: {item_id}"},
+        )
+
+
+def _minimal_imdb_meta(item_type: str, imdb_id: str) -> dict:
+    """Build a minimal meta entry using just an IMDb ID (for /stream/ requests)."""
+    name = imdb_id  # Stremio will fall back to TMDB/Cinemeta for the real name
+    return {
+        "meta": {
+            "id": imdb_id,
+            "type": item_type,
+            "name": name,
+        }
+    }
+
+
+# ============================================================
+# Stremio addon: stream
+# ============================================================
+@app.get("/stream/{item_type}/{item_id}.json")
+def stream(item_type: str, item_id: str, request: Request):
+    err = _require_token(request)
+    if err:
+        return err
+    log.info(f"stream type={item_type} id={item_id}")
+
+    # Strip .json if present
+    item_id = item_id.replace(".json", "")
+
+    streams = []
+
+    # FlixLatam items: flixlatam:{slug} or flixlatam:{slug}:{s}:{e}
+    if "flixlatam:" in item_id:
+        parts = item_id.split(":")
+        # parts[0] == "flixlatam", parts[1] == slug, optional parts[2]=season, parts[3]=episode
+        if len(parts) == 2 and item_type == "movie":
+            # flixlatam:{slug} movie
+            slug = parts[1]
+            info = flixlatam.get_movie_detail(slug)
+            if info and info.get("imdb_id"):
+                streams = flixlatam.resolve_movie_streams(info["imdb_id"])
+        elif len(parts) == 4 and item_type == "series":
+            # flixlatam:{slug}:{season}:{episode}
+            slug = parts[1]
+            season = int(parts[2])
+            episode = int(parts[3])
+            ep_imdb = flixlatam.get_episode_imdb_id(slug, season, episode)
+            if ep_imdb:
+                m = re.match(r"(tt\d+)", ep_imdb)
+                if m:
+                    streams = flixlatam.resolve_episode_streams(m.group(1), season, episode)
+
+    # Latanime items: latanime:{slug}:{season}:{episode}
+    elif "latanime:" in item_id and item_type == "series":
+        parts = item_id.split(":")
+        if len(parts) >= 4:
+            slug = parts[1]
+            episode = int(parts[3])
+            streams = latanime.get_episode_streams(slug, episode)
+
+    # SeriesFlix items: seriesflix:{slug}:{season}:{episode}
+    elif "seriesflix:" in item_id and item_type == "series":
+        parts = item_id.split(":")
+        if len(parts) >= 4:
+            slug = parts[1]
+            season = int(parts[2])
+            episode = int(parts[3])
+            streams = seriesflix.resolve_episode_streams(slug, season, episode)
+
+    # TioAnime items: tioanime:{slug}:{season}:{episode}
+    elif "tioanime:" in item_id and item_type == "series":
+        parts = item_id.split(":")
+        if len(parts) >= 4:
+            slug = parts[1]
+            episode = int(parts[3])
+            streams = tioanime.get_episode_streams(slug, episode)
+
+    # Fanpelis items: fanpelis:{slug} (movie) or fanpelis:{slug}:{s}:{e}:{post_id} (episode)
+    elif "fanpelis:" in item_id:
+        parts = item_id.split(":")
+        slug = parts[1] if len(parts) > 1 else ""
+        if item_type == "movie":
+            info = fanpelis.get_movie_detail(slug)
+            if info and info.get("post_id"):
+                streams = fanpelis.resolve_streams(info["post_id"])
+        elif item_type == "series" and len(parts) >= 5:
+            # fanpelis:{slug}:{season}:{episode}:{post_id}
+            post_id = int(parts[4]) if parts[4].isdigit() else None
+            if post_id:
+                streams = fanpelis.resolve_streams(post_id)
+
+    # CineCalidad items: cinecalidad:{slug}
+    elif "cinecalidad:" in item_id and item_type == "movie":
+        parts = item_id.split(":")
+        if len(parts) >= 2:
+            slug = parts[1]
+            streams = cinecalidad.resolve_movie_streams(slug)
+
+    # SoloLatino items: sololatino:{slug}
+    elif "sololatino:" in item_id:
+        parts = item_id.split(":")
+        if len(parts) >= 2:
+            slug = parts[1]
+            streams = sololatino.resolve_movie_streams(slug)
+
+    # Plain IMDb IDs - use the auto-scraper to search ALL providers
+    elif item_id.startswith("tt"):
+        if item_type == "movie":
+            # Auto-scrape across all providers
+            streams = autoscrape.find_movie_streams(item_id)
+        elif item_type == "series" and ":" in item_id:
+            parts = item_id.split(":")
+            if len(parts) >= 3:
+                imdb_id = parts[0]
+                season = int(parts[1])
+                episode = int(parts[2])
+                streams = autoscrape.find_episode_streams(imdb_id, season, episode)
+
+    if not streams:
+        return {"streams": []}
+    return {"streams": streams}
+
+
+# ============================================================
+# Health check
+# ============================================================
+@app.get("/")
+def home():
+    # Public endpoint (no token required) — used by Render's health check.
+    # Does NOT expose any streaming data, just service info.
+    return {
+        "status": "online",
+        "addon": ADDON_NAME,
+        "version": ADDON_VERSION,
+        "manifest": "/manifest.json" + ("?token=YOUR_TOKEN" if ADDON_TOKEN else ""),
+        "auth_required": bool(ADDON_TOKEN),
+    }
+
+
+@app.get("/stats")
+def stats(request: Request):
+    """Show cache statistics (requires token if configured)."""
+    err = _require_token(request)
+    if err:
+        return err
+    return {
+        "cache": autoscrape.get_cache_stats(),
+        "providers": ["FlixLatam", "Latanime", "SeriesFlix", "TioAnime", "Fanpelis"],
+        "auth_required": bool(ADDON_TOKEN),
+    }
+
+
+@app.api_route("/refresh/{item_type}/{item_id}", methods=["GET", "POST"])
+@app.api_route("/refresh/{item_type}/{item_id}.json", methods=["GET", "POST"])
+def refresh_cache(item_type: str, item_id: str, request: Request):
+    """
+    Invalidate the cache for a specific item and re-scrape.
+    
+    Usage:
+      GET /refresh/movie/tt0816692?token=success
+      → returns fresh streams after re-scraping
+    
+    This is the "refresh button" — when you want to re-search for a movie
+    that might have new streams since the last scrape.
+    """
+    err = _require_token(request)
+    if err:
+        return err
+    
+    item_id_clean = item_id.replace(".json", "")
+    
+    # Invalidate cache
+    was_cached = autoscrape.invalidate_cache(item_type, item_id_clean)
+    
+    # Re-scrape based on item type
+    if item_type == "movie" and item_id_clean.startswith("tt"):
+        streams = autoscrape.find_movie_streams(item_id_clean)
+    elif item_type == "series" and ":" in item_id_clean:
+        parts = item_id_clean.split(":")
+        if len(parts) >= 3 and parts[0].startswith("tt"):
+            imdb_id = parts[0]
+            season = int(parts[1])
+            episode = int(parts[2])
+            streams = autoscrape.find_episode_streams(imdb_id, season, episode)
+        else:
+            streams = []
+    else:
+        streams = []
+    
+    return {
+        "refreshed": True,
+        "was_cached": was_cached,
+        "item_type": item_type,
+        "item_id": item_id_clean,
+        "streams_found": len(streams),
+        "streams": streams,
+    }
+
+
+# ============================================================
+# .strm file endpoints (for Jellyfin/Emby/Plex integration)
+# ============================================================
+# A .strm file is a text file containing a URL. When Jellyfin/Emby scans
+# a library folder and finds a .strm file, it treats the URL inside as
+# the media source and plays it directly.
+#
+# Usage:
+#   GET /strm/movie/tt0816692.strm?token=success
+#   → returns a .strm file with the best stream URL for Interstellar
+#
+#   GET /strm/series/tt1196946:1:1.strm?token=success
+#   → returns a .strm file for The Mentalist S1E1
+
+from fastapi import Response
+
+@app.get("/strm/movie/{imdb_id}.strm")
+def strm_movie(imdb_id: str, request: Request):
+    """Return a .strm file for a movie (Jellyfin/Emby compatible)."""
+    err = _require_token(request)
+    if err:
+        return err
+    imdb_id = imdb_id.replace(".strm", "")
+    log.info(f"strm movie: {imdb_id}")
+    
+    # Get streams (uses cache)
+    streams = autoscrape.find_movie_streams(imdb_id)
+    if not streams:
+        return JSONResponse(status_code=404, content={"error": "No streams found"})
+    
+    # Take the best stream (already sorted by quality)
+    best_url = streams[0]["url"]
+    
+    # Return as .strm file (plain text with URL)
+    return Response(
+        content=best_url,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{imdb_id}.strm"',
+        },
+    )
+
+
+@app.get("/strm/series/{item_id}.strm")
+def strm_series(item_id: str, request: Request):
+    """Return a .strm file for an episode (Jellyfin/Emby compatible)."""
+    err = _require_token(request)
+    if err:
+        return err
+    item_id = item_id.replace(".strm", "")
+    log.info(f"strm series: {item_id}")
+    
+    parts = item_id.split(":")
+    if len(parts) < 3:
+        return JSONResponse(status_code=400, content={"error": "Format: imdb_id:season:episode"})
+    
+    imdb_id = parts[0]
+    season = int(parts[1])
+    episode = int(parts[2])
+    
+    streams = autoscrape.find_episode_streams(imdb_id, season, episode)
+    if not streams:
+        return JSONResponse(status_code=404, content={"error": "No streams found"})
+    
+    best_url = streams[0]["url"]
+    filename = f"{imdb_id}_S{season:02d}E{episode:02d}.strm"
+    
+    return Response(
+        content=best_url,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+# ============================================================
+# Library API (for sync scripts and Jellyfin integration)
+# ============================================================
+@app.get("/library")
+def library_home(request: Request):
+    """Library home — shows available endpoints."""
+    err = _require_token(request)
+    if err:
+        return err
+    base = str(request.base_url).rstrip("/")
+    q = f"?token={ADDON_TOKEN}" if ADDON_TOKEN else ""
+    return {
+        "library": {
+            "movies_json": f"{base}/library/movies.json{q}",
+            "series_json": f"{base}/library/series.json{q}",
+            "strm_movie": f"{base}/strm/movie/{{imdb_id}}.strm{q}",
+            "strm_episode": f"{base}/strm/series/{{imdb_id}}:{{season}}:{{episode}}.strm{q}",
+            "sync_script": "Run the sync script to download all .strm files for Jellyfin",
+        },
+        "providers": ["FlixLatam", "Latanime", "SeriesFlix", "TioAnime", "Fanpelis", "CineCalidad", "SoloLatino"],
+        "total_movies": "see /library/movies.json",
+        "total_series": "see /library/series.json",
+    }
+
+
+@app.get("/library/movies.json")
+def library_movies(request: Request, page: int = 1, search: str = ""):
+    """JSON list of all movies from all providers (for sync scripts)."""
+    err = _require_token(request)
+    if err:
+        return err
+    
+    import concurrent.futures
+    
+    all_movies = []
+    seen = set()
+    
+    def fetch(name, fn):
+        try:
+            return fn()
+        except:
+            return []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(fetch, "Fanpelis", lambda: fanpelis.get_movies(page=page, query=search)): "Fanpelis",
+            executor.submit(fetch, "CineCalidad", lambda: cinecalidad.get_movies(page=page, query=search)): "CineCalidad",
+            executor.submit(fetch, "FlixLatam", lambda: flixlatam.get_movies(page=page)): "FlixLatam",
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=30):
+            provider = futures[future]
+            try:
+                for m in future.result():
+                    key = m.get("slug", m.get("name", ""))
+                    if key not in seen:
+                        seen.add(key)
+                        m["provider"] = provider
+                        m["strm_url"] = f"/strm/movie/{m.get('id', '')}.strm"
+                        all_movies.append(m)
+            except:
+                pass
+    
+    return {
+        "page": page,
+        "total": len(all_movies),
+        "movies": all_movies,
+    }
+
+
+@app.get("/library/series.json")
+def library_series(request: Request, page: int = 1, search: str = ""):
+    """JSON list of all series from all providers (for sync scripts)."""
+    err = _require_token(request)
+    if err:
+        return err
+    
+    import concurrent.futures
+    
+    all_series = []
+    seen = set()
+    
+    def fetch(name, fn):
+        try:
+            return fn()
+        except:
+            return []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(fetch, "SeriesFlix", lambda: seriesflix.get_series_list(page=page, query=search)): "SeriesFlix",
+            executor.submit(fetch, "Fanpelis", lambda: fanpelis.get_tvshows(page=page, query=search)): "Fanpelis",
+            executor.submit(fetch, "Latanime", lambda: latanime.get_anime_list(page=page, query=search)): "Latanime",
+            executor.submit(fetch, "TioAnime", lambda: tioanime.get_anime_list(page=page, query=search)): "TioAnime",
+            executor.submit(fetch, "FlixLatam", lambda: flixlatam.get_series(page=page)): "FlixLatam",
+        }
+        for future in concurrent.futures.as_completed(futures, timeout=30):
+            provider = futures[future]
+            try:
+                for s in future.result():
+                    key = s.get("slug", s.get("name", ""))
+                    if key not in seen:
+                        seen.add(key)
+                        s["provider"] = provider
+                        all_series.append(s)
+            except:
+                pass
+    
+    return {
+        "page": page,
+        "total": len(all_series),
+        "series": all_series,
+    }
+
+
+# ============================================================
+# Simple HTML UI for manual testing (no Gradio, lightweight)
+# ============================================================
+@app.get("/ui", response_class=HTMLResponse)
+def ui():
+    return """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>StreamFlix Addon</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;background:#0f0f0f;color:#eee;line-height:1.5}
+h1{color:#10b981;border-bottom:1px solid #333;padding-bottom:.5rem}
+h2{color:#3291ff;margin-top:2rem}
+input,button,select{padding:.6rem;margin:.2rem;background:#1a1a1a;border:1px solid #333;color:#eee;border-radius:4px;font-size:14px}
+button{background:#10b981;color:#000;cursor:pointer;font-weight:600}
+button:hover{background:#0e9c72}
+pre{background:#1a1a1a;padding:1rem;border-radius:4px;overflow-x:auto;border:1px solid #333;max-height:400px}
+a{color:#3291ff}
+code{background:#1a1a1a;padding:2px 6px;border-radius:3px;color:#10b981}
+.status{padding:.5rem 1rem;background:#1a2a1a;border-left:3px solid #10b981;margin:1rem 0;border-radius:4px}
+</style>
+</head>
+<body>
+<h1>StreamFlix Reborn — Stremio Addon</h1>
+<div class="status">
+<strong>Addon URL para Stremio:</strong><br>
+<code id="manifest-url"></code>
+</div>
+
+<h2>Resolver Película</h2>
+<p>IMDb ID (ej: tt41228546) o slug FlixLatam (ej: sultana-hUFIlu)</p>
+<input id="movie-input" placeholder="tt41228546" style="width:300px">
+<button onclick="resolveMovie()">Resolver</button>
+<pre id="movie-result">Resultado aparecerá aquí...</pre>
+
+<h2>Resolver Episodio</h2>
+<p>IMDb ID (ej: tt45403168) o slug Latanime (ej: la-mision-de-la-familia-yozakura-s2-castellano)</p>
+<input id="ep-id" placeholder="tt45403168" style="width:300px">
+<input id="ep-s" type="number" value="1" style="width:60px" placeholder="T">
+<input id="ep-e" type="number" value="1" style="width:60px" placeholder="E">
+<button onclick="resolveEpisode()">Resolver</button>
+<pre id="ep-result">Resultado aparecerá aquí...</pre>
+
+<h2>Explorar Catálogo</h2>
+<select id="cat-type">
+<option value="movie/flixlatam_movies">FlixLatam Películas</option>
+<option value="movie/flixlatam_popular">FlixLatam Populares</option>
+<option value="series/flixlatam_series">FlixLatam Series</option>
+<option value="series/latanime_catalog">Latanime Anime</option>
+</select>
+<input id="cat-page" type="number" value="1" style="width:60px" placeholder="Pág">
+<button onclick="browseCatalog()">Cargar</button>
+<pre id="cat-result">Resultado aparecerá aquí...</pre>
+
+<script>
+const MANIFEST = location.origin + '/manifest.json';
+document.getElementById('manifest-url').textContent = MANIFEST;
+
+async function resolveMovie() {
+  const v = document.getElementById('movie-input').value.trim();
+  const r = await fetch(`/stream/movie/${v}.json`);
+  const d = await r.json();
+  document.getElementById('movie-result').textContent = JSON.stringify(d, null, 2);
+}
+
+async function resolveEpisode() {
+  const id = document.getElementById('ep-id').value.trim();
+  const s = document.getElementById('ep-s').value;
+  const e = document.getElementById('ep-e').value;
+  const r = await fetch(`/stream/series/${id}:${s}:${e}.json`);
+  const d = await r.json();
+  document.getElementById('ep-result').textContent = JSON.stringify(d, null, 2);
+}
+
+async function browseCatalog() {
+  const t = document.getElementById('cat-type').value;
+  const p = document.getElementById('cat-page').value;
+  const r = await fetch(`/catalog/${t}.json?page=${p}`);
+  const d = await r.json();
+  document.getElementById('cat-result').textContent = JSON.stringify(d, null, 2).slice(0, 5000);
+}
+</script>
+</body>
+</html>"""
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))
+    log.info(f"Starting StreamFlix Stremio addon on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
